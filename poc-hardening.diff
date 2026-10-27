@@ -1,0 +1,678 @@
+--- a/gradio_app.py
++++ b/gradio_app.py
+@@ -1,191 +1,165 @@
++import os
++import json
++import math
++import tempfile
++import threading
++import time
++import warnings
++from pathlib import Path
++from uuid import uuid4
++
++CKPT_DIR = "/content/models/SoulX-FlashHead-1_3B"
++WAV2VEC_DIR = "/content/models/wav2vec2-base-960h"
++MODEL_TYPE = "lite"
++MAX_UPLOAD_BYTES = 12 * 1024 * 1024
++RESULTS_DIR = Path(__file__).absolute().parent / "gradio_results"
++UPLOAD_DIR = Path(tempfile.gettempdir()) / "soulx-flashhead-uploads"
++os.environ["GRADIO_ANALYTICS_ENABLED"] = "False"
++os.environ["GRADIO_TEMP_DIR"] = str(UPLOAD_DIR)
++
++
++def read_credentials():
++    username = os.environ.get("APP_USERNAME", "").strip()
++    password = os.environ.get("APP_PASSWORD", "")
++    if not username or not password:
++        raise SystemExit("Set APP_USERNAME and APP_PASSWORD before starting the app.")
++    if len(password) < 16:
++        raise SystemExit("APP_PASSWORD must contain at least 16 characters.")
++    return username, password
++
++
++# Validate credentials before loading the UI or GPU dependencies.
++username, password = read_credentials()
++
+ import gradio as gr
+-import os
+ import torch
+ import numpy as np
+-import time
+ import imageio
+ import librosa
+ import subprocess
+-from datetime import datetime
+ from collections import deque
+-from loguru import logger
+-
+-# Import internal modules
+-from flash_head.inference import get_pipeline, get_base_data, get_infer_params, get_audio_embedding, run_pipeline
+-
+-# Global variable to store the loaded pipeline
++from PIL import Image
++
++from flash_head.inference import (
++    get_pipeline, get_base_data, get_infer_params, get_audio_embedding, run_pipeline,
++)
++
+ pipeline = None
+-loaded_ckpt_dir = None
+-loaded_wav2vec_dir = None
+-loaded_model_type = None
+-
+-def run_multi_gpu_inference(
+-    gpu_ids,
+-    ckpt_dir,
+-    wav2vec_dir,
+-    model_type,
+-    cond_image,
+-    audio_path,
+-    audio_encode_mode,
+-    use_face_crop,
+-    seed,
+-    progress=gr.Progress()
+-):
+-    """
+-    Executes the inference using torchrun for Multi-GPU support.
+-    """
+-    gpu_list = [x.strip() for x in gpu_ids.split(',') if x.strip()]
+-    num_gpus = len(gpu_list)
+-    if num_gpus == 0:
+-        raise gr.Error("Please specify at least one GPU ID (e.g., '0,1,2,3').")
+-
+-    cuda_visible_devices = ",".join(gpu_list)
+-    
+-    # Define output path beforehand to know where to look
+-    output_dir = 'gradio_results_multigpu'
+-    if not os.path.exists(output_dir):
+-        os.makedirs(output_dir)
+-    
+-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+-    # Note: generate_video.py generates its own filename, so we pass --save_file to control it
+-    filename = f"res_{timestamp}.mp4"
+-    save_path = os.path.abspath(os.path.join(output_dir, filename))
+-
+-    # Construct the command
+-    # CUDA_VISIBLE_DEVICES=... torchrun --nproc_per_node=... generate_video.py ...
+-    cmd = [
+-        "torchrun",
+-        f"--nproc_per_node={num_gpus}",
+-        "generate_video.py",
+-        "--ckpt_dir", ckpt_dir,
+-        "--wav2vec_dir", wav2vec_dir,
+-        "--model_type", model_type,
+-        "--cond_image", cond_image,
+-        "--audio_path", audio_path,
+-        "--audio_encode_mode", audio_encode_mode,
+-        "--use_face_crop", str(use_face_crop),
+-        "--base_seed", str(int(seed)),
+-        "--save_file", save_path,
+-    ]
+-
+-    env = os.environ.copy()
+-    env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+-    
+-    logger.info(f"Starting Multi-GPU inference with command: {' '.join(cmd)}")
+-    logger.info(f"Visible Devices: {cuda_visible_devices}")
+-    
+-    progress(0, desc="Starting Multi-GPU process... (Check terminal for logs)")
+-    
++
++
++def cleanup_results():
++    # Never traverse directories or follow links outside the fixed results folder.
++    if RESULTS_DIR.is_symlink():
++        raise ValueError("Invalid results directory")
++    RESULTS_DIR.mkdir(exist_ok=True)
++    cutoff = time.time() - 3600
++    for path in RESULTS_DIR.iterdir():
++        if not path.is_symlink() and path.is_file() and path.stat().st_mtime < cutoff:
++            path.unlink(missing_ok=True)
++
++
++def cleanup_periodically():
++    while True:
++        try:
++            cleanup_results()
++        except Exception:
++            pass  # Do not expose paths or exception details.
++        time.sleep(300)
++
++
++def validate_uploads(cond_image, audio_path):
+     try:
+-        # Run the command
+-        process = subprocess.Popen(
+-            cmd, 
+-            env=env, 
+-            stdout=subprocess.PIPE, 
+-            stderr=subprocess.STDOUT, 
+-            text=True, 
+-            bufsize=1, 
+-            universal_newlines=True
++        paths = [Path(cond_image), Path(audio_path)]
++        for path in paths:
++            # Accept only uploaded cache files, never arbitrary server paths.
++            if path.is_symlink() or not path.resolve().is_relative_to(UPLOAD_DIR.resolve()):
++                raise ValueError("Invalid upload")
++            if not path.is_file() or not 0 < path.stat().st_size <= MAX_UPLOAD_BYTES:
++                raise ValueError("Invalid upload")
++        with warnings.catch_warnings():
++            warnings.simplefilter("error", Image.DecompressionBombWarning)
++            with Image.open(paths[0]) as image:
++                if not (0 < image.width <= 4096 and 0 < image.height <= 4096):
++                    raise ValueError("Invalid image dimensions")
++                image.verify()
++            with Image.open(paths[0]) as image:
++                image.load()
++        probe = subprocess.run(
++            ["ffprobe", "-v", "error", "-select_streams", "a:0",
++             "-show_entries", "stream=codec_type,duration:format=duration",
++             "-of", "json", str(paths[1].resolve())],
++            capture_output=True, text=True, check=True, timeout=15,
+         )
+-        
+-        # Read output line by line to update progress (simple heuristic)
+-        for line in process.stdout:
+-            print(line, end='') # Print to console for debugging
+-            if "Generate video chunk" in line:
+-                progress(0.5, desc="Generating chunks...")
+-            elif "Saving generated video" in line:
+-                progress(0.9, desc="Saving video...")
+-        
+-        process.wait()
+-        
+-        if process.returncode != 0:
+-            raise gr.Error(f"Multi-GPU process failed with return code {process.returncode}")
+-            
+-    except Exception as e:
+-        logger.error(f"Error during multi-gpu execution: {e}")
+-        raise gr.Error(f"Multi-GPU execution failed: {e}")
+-
+-    if os.path.exists(save_path):
+-        return save_path
+-    else:
+-        raise gr.Error("Output video file was not found. Check terminal logs for errors.")
++        metadata = json.loads(probe.stdout)
++        streams = metadata.get("streams", [])
++        if not streams or streams[0].get("codec_type") != "audio":
++            raise ValueError("No audio stream")
++        duration = float(metadata.get("format", {}).get("duration", streams[0].get("duration", "nan")))
++        if not math.isfinite(duration) or not 0 < duration <= 30:
++            raise ValueError("Invalid audio duration")
++    except Exception:
++        raise gr.Error(
++            "Upload a valid image up to 4096 x 4096 pixels and nonempty audio up to "
++            "30 seconds. Each file must be 12 MB or smaller."
++        ) from None
++
+ 
+ def save_video_to_file(frames_list, video_path, audio_path, fps):
+-    """
+-    Helper function to save the video, similar to generate_video.py but adapted for function usage.
+-    """
+     temp_video_path = video_path.replace('.mp4', '_temp.mp4')
+-    
+-    # Make sure directory exists
+-    os.makedirs(os.path.dirname(video_path), exist_ok=True)
+-    
+     try:
+-        with imageio.get_writer(temp_video_path, format='mp4', mode='I',
+-                                fps=fps , codec='h264', ffmpeg_params=['-bf', '0']) as writer:
++        with imageio.get_writer(
++            temp_video_path, format='mp4', mode='I', fps=fps,
++            codec='h264', ffmpeg_params=['-bf', '0'],
++        ) as writer:
+             for frames in frames_list:
+-                frames = frames.numpy().astype(np.uint8)
+-                for i in range(frames.shape[0]):
+-                    frame = frames[i, :, :, :]
++                for frame in frames.numpy().astype(np.uint8):
+                     writer.append_data(frame)
+-        
+-        # merge video and audio
+-        # Use aac audio codec for better compatibility instead of copy
+-        # This handles cases where input audio (like PCM wav) is not supported in MP4 container
+-        cmd = ['ffmpeg', '-i', temp_video_path, '-i', audio_path, '-c:v', 'copy', '-c:a', 'aac', '-shortest', video_path, '-y']
+-        subprocess.run(cmd, check=True)
+-    except Exception as e:
+-        logger.error(f"Error saving video: {e}")
+-        if os.path.exists(temp_video_path):
+-            os.remove(temp_video_path)
+-        raise e
++        subprocess.run(
++            ['ffmpeg', '-v', 'error', '-i', temp_video_path, '-i', audio_path,
++             '-c:v', 'copy', '-c:a', 'aac', '-shortest', video_path, '-y'],
++            check=True, capture_output=True, timeout=120,
++        )
+     finally:
+-        if os.path.exists(temp_video_path):
+-            os.remove(temp_video_path)
+-    
++        Path(temp_video_path).unlink(missing_ok=True)
+     return video_path
+ 
+-def run_inference(
+-    ckpt_dir,
+-    wav2vec_dir,
+-    model_type,
+-    cond_image,
+-    audio_path,
+-    audio_encode_mode,
+-    seed,
+-    use_face_crop,
+-    progress=gr.Progress()
+-):
+-    global pipeline, loaded_ckpt_dir, loaded_wav2vec_dir, loaded_model_type
+-
+-    # 1. Load Model if needed
+-    if pipeline is None or loaded_ckpt_dir != ckpt_dir or loaded_wav2vec_dir != wav2vec_dir or loaded_model_type != model_type:
+-        progress(0, desc="Loading Model...")
+-        logger.info(f"Loading pipeline with ckpt_dir={ckpt_dir}, wav2vec_dir={wav2vec_dir}")
+-        try:
+-            pipeline = get_pipeline(world_size=1, ckpt_dir=ckpt_dir, model_type=model_type, wav2vec_dir=wav2vec_dir)
+-            loaded_ckpt_dir = ckpt_dir
+-            loaded_wav2vec_dir = wav2vec_dir
+-            loaded_model_type = model_type
+-        except Exception as e:
+-            logger.error(f"Failed to load model: {e}")
+-            raise gr.Error(f"Failed to load model: {e}")
+-
+-    # 2. Prepare Data
+-    progress(0.1, desc="Preparing Data...")
+-    
+-    # Handle seed
++
++def run_inference(cond_image, audio_path, seed, use_face_crop, progress=gr.Progress()):
++    global pipeline
++    try:
++        cleanup_results()
++        validate_uploads(cond_image, audio_path)
++        return generate_video(cond_image, audio_path, seed, use_face_crop, progress)
++    except gr.Error:
++        raise
++    except Exception:
++        raise gr.Error("Video generation failed. Please check your media and try again.") from None
++
++
++def generate_video(cond_image, audio_path, seed, use_face_crop, progress):
++    global pipeline
++    # Decode and check the actual sample count before loading the GPU pipeline.
++    infer_params = get_infer_params()
++    sample_rate = infer_params['sample_rate']
++    human_speech_array_all, _ = librosa.load(
++        audio_path, sr=sample_rate, mono=True, duration=30 + 1 / sample_rate,
++    )
++    if not 0 < len(human_speech_array_all) <= 30 * sample_rate:
++        raise gr.Error("Audio must be nonempty and no longer than 30 seconds.")
++    if not np.isfinite(human_speech_array_all).all():
++        raise gr.Error("Please upload a valid audio file.")
++    if pipeline is None:
++        progress(0, desc="Loading model...")
++        pipeline = get_pipeline(
++            world_size=1, ckpt_dir=CKPT_DIR, model_type=MODEL_TYPE,
++            wav2vec_dir=WAV2VEC_DIR,
++        )
+     base_seed = int(seed) if seed >= 0 else 9999
+-
+-    # Prepare base data (prompt, image)
+-    try:
+-        get_base_data(pipeline, cond_image_path_or_dir=cond_image, base_seed=base_seed, use_face_crop=use_face_crop)
+-    except Exception as e:
+-        logger.error(f"Error in get_base_data: {e}")
+-        raise gr.Error(f"Error processing inputs: {e}")
+-
+-    # Get parameters from global config (infer_params)
++    progress(0.1, desc="Preparing media...")
++    get_base_data(
++        pipeline, cond_image_path_or_dir=cond_image, base_seed=base_seed,
++        use_face_crop=use_face_crop,
++    )
+     infer_params = get_infer_params()
+-
+-    sample_rate = infer_params['sample_rate']
+     tgt_fps = infer_params['tgt_fps']
+     cached_audio_duration = infer_params['cached_audio_duration']
+@@ -193,235 +167,111 @@
+     motion_frames_num = infer_params['motion_frames_num']
+     slice_len = frame_num - motion_frames_num
+-
++    human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
+     generated_list = []
+ 
+-    # Load Audio
+-    try:
+-        human_speech_array_all, _ = librosa.load(audio_path, sr=sample_rate, mono=True)
+-    except Exception as e:
+-        raise gr.Error(f"Failed to load audio file: {e}")
+-
+-    human_speech_array_slice_len = slice_len * sample_rate // tgt_fps
+-    human_speech_array_frame_num = frame_num * sample_rate // tgt_fps
+-
+-    logger.info("Data preparation done. Start to generate video...")
+-
+-    # 3. Generation Loop
+-    if audio_encode_mode == 'once':
+-        # pad audio with silence to avoid truncating the last chunk
+-        remainder = (len(human_speech_array_all) - human_speech_array_frame_num) % human_speech_array_slice_len
+-        if remainder > 0:
+-            pad_length = human_speech_array_slice_len - remainder
+-            human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(pad_length, dtype=human_speech_array_all.dtype)])
+-
+-        audio_embedding_all = get_audio_embedding(pipeline, human_speech_array_all)
+-        audio_embedding_chunks_list = [audio_embedding_all[:, i * slice_len: i * slice_len + frame_num].contiguous() for i in range((audio_embedding_all.shape[1]-frame_num) // slice_len)]
++    cached_audio_length_sum = sample_rate * cached_audio_duration
++    audio_end_idx = cached_audio_duration * tgt_fps
++    audio_start_idx = audio_end_idx - frame_num
++
++    audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
++
++    # pad audio with silence to avoid truncating the last chunk
++    remainder = len(human_speech_array_all) % human_speech_array_slice_len
++    if remainder > 0:
++        pad_length = human_speech_array_slice_len - remainder
++        human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(pad_length, dtype=human_speech_array_all.dtype)])
++
++    # split audio embedding into chunks: 28, 28, 28, 28, ...
++    human_speech_array_slices = human_speech_array_all.reshape(-1, human_speech_array_slice_len)
++
++    total_chunks = len(human_speech_array_slices)
++    for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
++        progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Generating chunk {chunk_idx+1}/{total_chunks}")
+         
+-        total_chunks = len(audio_embedding_chunks_list)
+-        for chunk_idx, audio_embedding_chunk in enumerate(audio_embedding_chunks_list):
+-            progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Generating chunk {chunk_idx+1}/{total_chunks}")
+-            
+-            torch.cuda.synchronize()
+-            start_time = time.time()
+-
+-            # inference
+-            video = run_pipeline(pipeline, audio_embedding_chunk)
+-
+-            if chunk_idx != 0:
+-                video = video[motion_frames_num:]
+-
+-            torch.cuda.synchronize()
+-            end_time = time.time()
+-            logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s")
+-            
+-            generated_list.append(video.cpu())
+-
+-    elif audio_encode_mode == 'stream':
+-        cached_audio_length_sum = sample_rate * cached_audio_duration
+-        audio_end_idx = cached_audio_duration * tgt_fps
+-        audio_start_idx = audio_end_idx - frame_num
+-
+-        audio_dq = deque([0.0] * cached_audio_length_sum, maxlen=cached_audio_length_sum)
+-
+-        # pad audio with silence to avoid truncating the last chunk
+-        remainder = len(human_speech_array_all) % human_speech_array_slice_len
+-        if remainder > 0:
+-            pad_length = human_speech_array_slice_len - remainder
+-            human_speech_array_all = np.concatenate([human_speech_array_all, np.zeros(pad_length, dtype=human_speech_array_all.dtype)])
+-
+-        # split audio embedding into chunks: 28, 28, 28, 28, ...
+-        human_speech_array_slices = human_speech_array_all.reshape(-1, human_speech_array_slice_len)
+-
+-        total_chunks = len(human_speech_array_slices)
+-        for chunk_idx, human_speech_array in enumerate(human_speech_array_slices):
+-            progress(0.2 + 0.7 * (chunk_idx / total_chunks), desc=f"Generating chunk {chunk_idx+1}/{total_chunks}")
+-            
+-            # streaming encode audio chunks
+-            audio_dq.extend(human_speech_array.tolist())
+-            audio_array = np.array(audio_dq)
+-            audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
+-
+-            torch.cuda.synchronize()
+-            start_time = time.time()
+-
+-            # inference
+-            video = run_pipeline(pipeline, audio_embedding)
+-            video = video[motion_frames_num:]
+-
+-            torch.cuda.synchronize()
+-            end_time = time.time()
+-            logger.info(f"Generate video chunk-{chunk_idx} done, cost time: {(end_time - start_time):.2f}s")
+-
+-            generated_list.append(video.cpu())
+-
+-    # 4. Save Video
+-    progress(0.95, desc="Saving Video...")
+-    output_dir = 'gradio_results'
+-    if not os.path.exists(output_dir):
+-        os.makedirs(output_dir)
+-    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+-    filename = f"res_{timestamp}.mp4"
+-    save_path = os.path.join(output_dir, filename)
+-    
+-    final_video_path = save_video_to_file(generated_list, save_path, audio_path, fps=tgt_fps)
+-    logger.info(f"Saved to {final_video_path}")
+-    
+-    return final_video_path
+-
+-# Gradio Interface Definition
+-with gr.Blocks(title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft()) as app:
++        # streaming encode audio chunks
++        audio_dq.extend(human_speech_array.tolist())
++        audio_array = np.array(audio_dq)
++        audio_embedding = get_audio_embedding(pipeline, audio_array, audio_start_idx, audio_end_idx)
++
++        torch.cuda.synchronize()
++
++        # inference
++        video = run_pipeline(pipeline, audio_embedding)
++        video = video[motion_frames_num:]
++
++        torch.cuda.synchronize()
++
++        generated_list.append(video.cpu())
++
++    progress(0.95, desc="Saving video...")
++    save_path = str(RESULTS_DIR / f"res_{uuid4().hex}.mp4")
++    return save_video_to_file(generated_list, save_path, audio_path, fps=tgt_fps)
++
++
++with gr.Blocks(
++    title="SoulX-FlashHead Video Generator", theme=gr.themes.Soft(),
++    analytics_enabled=False, delete_cache=(1800, 1800),
++) as app:
+     gr.Markdown("# ⚡ SoulX-FlashHead Video Generator")
+     gr.Markdown("Upload an image and an audio file to generate a talking head video.")
+-
++    gr.Markdown(
++        "Upload only media you own or have permission to use. Outputs are deleted automatically."
++    )
+     with gr.Row():
+         with gr.Column(scale=1):
+-            # 1. Main Inputs Section (Always Visible)
+-            with gr.Group():
+-                gr.Markdown("### 🎬 Generation Inputs")
+-                with gr.Row():
+-                    cond_image_input = gr.Image(
+-                        label="Condition Image", 
+-                        type="filepath", 
+-                        value="examples/girl.png",
+-                        height=300
+-                    )
+-                    audio_path_input = gr.Audio(
+-                        label="Audio Input", 
+-                        type="filepath", 
+-                        value="examples/podcast_sichuan_16k.wav"
+-                    )
+-
+-            # 2. Main Action Button
++            gr.Markdown("### 🎬 Generation Inputs")
++            # File components preserve original bytes for size and format validation.
++            cond_image_input = gr.File(
++                label="Condition Image (up to 4096 x 4096, 12 MB)",
++                type="filepath", file_types=["image"],
++            )
++            audio_path_input = gr.File(
++                label="Audio Input (up to 30 seconds, 12 MB)",
++                type="filepath", file_types=["audio"],
++            )
++            with gr.Accordion("⚙️ Inference Settings", open=False):
++                use_face_crop_input = gr.Checkbox(label="Use Face Crop", value=False)
++                seed_input = gr.Number(label="Random Seed", value=9999, precision=0)
+             generate_btn = gr.Button("🚀 Generate Video", variant="primary", size="lg")
+-
+-            # 3. Advanced Configuration (Collapsed by default to save space)
+-            with gr.Accordion("⚙️ Advanced Settings & Model Configuration", open=False):
+-                with gr.Tabs():
+-                    with gr.TabItem("Execution Mode"):
+-                        model_type_input = gr.Dropdown(
+-                            label="FlashHead Model Type", 
+-                            choices=[
+-                                ("Pro Version (Multi-GPU Support)", "pro"),
+-                                ("Lite Version (Single GPU Only)", "lite")
+-                            ],
+-                            value="pro",
+-                            info="Select the model variant. 'pro' supports both single and multi-GPU, 'lite' is single GPU only."
+-                        )
+-                        mode_input = gr.Radio(
+-                            choices=["Single GPU", "Multi-GPU"],
+-                            value="Single GPU",
+-                            label="Execution Mode",
+-                            visible=True,
+-                            info="Single GPU: Keeps model in memory for fast interactive use. Multi-GPU: Spawns new process, better for stability/isolation."
+-                        )
+-                        gpu_ids_input = gr.Textbox(
+-                            label="GPU IDs (Multi-GPU only)",
+-                            value="0,1",
+-                            visible=False,
+-                            placeholder="0,1,2,3",
+-                        )
+-
+-                    with gr.TabItem("Model Paths"):
+-                        ckpt_dir_input = gr.Textbox(
+-                            label="FlashHead Checkpoint Directory", 
+-                            value="models/SoulX-FlashHead-1_3B",
+-                            info="Path to the FlashHead model checkpoint."
+-                        )
+-                        wav2vec_dir_input = gr.Textbox(
+-                            label="Wav2Vec Directory", 
+-                            value="models/wav2vec2-base-960h",
+-                            info="Path to the Wav2Vec model checkpoint."
+-                        )
+-
+-                    with gr.TabItem("Inference Params"):
+-                        audio_encode_mode_input = gr.Radio(
+-                            label="Audio Encode Mode", 
+-                            choices=["stream", "once"], 
+-                            value="stream",
+-                            info="Stream: chunk-by-chunk; Once: all at once."
+-                        )
+-                        use_face_crop_input = gr.Checkbox(
+-                            label="Use Face Crop", 
+-                            value=False,
+-                            info="Enable face detection and crop for condition image."
+-                        )
+-                        seed_input = gr.Number(
+-                            label="Random Seed", 
+-                            value=9999, 
+-                            precision=0
+-                        )
+-
+         with gr.Column(scale=1):
+             gr.Markdown("### 📺 Output Video")
+             video_output = gr.Video(label="Generated Video", height=500)
+-
+-    # Event Handlers
+-    def update_visibility(model_type, mode):
+-        if model_type == "lite":
+-            return [
+-                gr.update(visible=False, value="Single GPU"),  # mode_input
+-                gr.update(visible=False),  # gpu_ids_input
+-            ]
+-        else:  # pro
+-            if mode == "Multi-GPU":
+-                return [
+-                    gr.update(visible=True),  # mode_input
+-                    gr.update(visible=True),  # gpu_ids_input
+-                ]
+-            else:  # Single GPU
+-                return [
+-                    gr.update(visible=True),  # mode_input
+-                    gr.update(visible=False),  # gpu_ids_input
+-                ]
+-
+-    model_type_input.change(fn=update_visibility, inputs=[model_type_input, mode_input], outputs=[mode_input, gpu_ids_input])
+-    mode_input.change(fn=update_visibility, inputs=[model_type_input, mode_input], outputs=[mode_input, gpu_ids_input])
+-
+-    def dispatch_inference(
+-        mode, gpu_ids, ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop
+-    ):
+-        if mode == "Single GPU":
+-            return run_inference(ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop)
+-        else:
+-            return run_multi_gpu_inference(gpu_ids, ckpt, wav2vec, model_type, img, audio, enc_mode, seed, use_face_crop)
+-
+-    # Event Binding
+     generate_btn.click(
+-        fn=dispatch_inference,
+-        inputs=[
+-            mode_input,
+-            gpu_ids_input,
+-            ckpt_dir_input,
+-            wav2vec_dir_input,
+-            model_type_input,
+-            cond_image_input,
+-            audio_path_input,
+-            audio_encode_mode_input,
+-            seed_input,
+-            use_face_crop_input
++        fn=run_inference,
++        inputs=[cond_image_input, audio_path_input, seed_input, use_face_crop_input],
++        outputs=video_output, concurrency_limit=1, api_name=False,
++    )
++
++# Gradio 5.50.0 has no run-history feature or launch argument. Keep the explicit
++# privacy setting without upgrading into a Transformers/huggingface-hub conflict.
++_launch_without_history = app.launch
++
++
++def launch_without_history(*, run_history=False, **kwargs):
++    if run_history is not False:
++        raise ValueError("Run history must remain disabled.")
++    return _launch_without_history(**kwargs)
++
++
++app.launch = launch_without_history
++
++if __name__ == "__main__":
++    threading.Thread(target=cleanup_periodically, daemon=True).start()
++    app.queue(default_concurrency_limit=1, max_size=2)
++    app.launch(
++        server_name="127.0.0.1",
++        share=True,
++        auth=(username, password),
++        auth_message="Private POC — authorized testers only.",
++        max_file_size="12mb",
++        max_threads=1,
++        show_error=False,
++        run_history=False,
++        enable_monitoring=False,
++        strict_cors=True,
++        blocked_paths=[
++            "/content/models",
++            "/root/.cache",
++            "/content/.cache",
+         ],
+-        outputs=video_output
+-    ) 
+-
+-if __name__ == "__main__":
+-    app.launch()
++    )
+--- /dev/null
++++ b/POC_VALIDATION.md
+@@ -0,0 +1,7 @@
++# POC validation
++
++- `python -m py_compile gradio_app.py`: PASS (Python 3.12.3).
++- 17 focused checks: PASS, covering missing/short credentials, valid uploads, invalid/oversized images and files, missing audio streams, zero/overlong/nonfinite durations, arbitrary path rejection, subprocess argument safety, cleanup boundaries, and launch-adapter enforcement. ffprobe responses were mocked.
++- Live Gradio launch, share authentication, FFmpeg processing, and CUDA inference were not run; Gradio and ffprobe are unavailable in this local environment.
++- Keep the pinned [Gradio 5.50.0](https://pypi.org/project/gradio/5.50.0/). It has no run-history feature or `run_history` launch argument; a narrow launch adapter accepts only `run_history=False`. Gradio 6.30.0 requires a Hugging Face Hub version incompatible with the pinned Transformers version.
++- Set `APP_USERNAME` and `APP_PASSWORD` in the server environment, then run `python gradio_app.py` from the repository root. Use only the authenticated share URL remotely; the local listener binds to loopback.
