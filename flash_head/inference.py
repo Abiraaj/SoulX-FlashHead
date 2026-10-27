@@ -72,6 +72,8 @@ def get_audio_embedding(pipeline, audio_array, audio_start_idx=-1, audio_end_idx
 def run_pipeline(pipeline, audio_embedding):
     audio_embedding = audio_embedding.to(pipeline.device)
     sample = pipeline.generate(audio_embedding)
+    if not torch.isfinite(sample).all():
+        raise ValueError("Generation produced invalid frames; try different media or a BF16-capable GPU.")
     sample_frames = (((sample+1)/2).permute(1,2,3,0).clip(0,1) * 255).contiguous()
     return sample_frames
 

@@ -21,6 +21,17 @@ COMPILE_VAE = True
 # use parallel vae to speedup decode/encode, only support WanVAE
 USE_PARALLEL_VAE = True
 
+
+def get_inference_dtype(device):
+    """Prefer native BF16; use FP16 on CUDA devices such as the Tesla T4."""
+    if torch.device(device).type != "cuda":
+        return torch.float32
+    native_bf16 = (
+        torch.cuda.get_device_capability(device)[0] >= 8
+        and torch.cuda.is_bf16_supported()
+    )
+    return torch.bfloat16 if native_bf16 else torch.float16
+
 def get_cond_image_dict(cond_image_path_or_dir, use_face_crop):
     def get_image(cond_image_path, use_face_crop):
         if use_face_crop:
@@ -59,7 +70,7 @@ class FlashHeadPipeline:
         model_type,
         wav2vec_dir,
         device="cuda",
-        param_dtype=torch.bfloat16,
+        param_dtype=None,
         use_usp=False,
         num_timesteps=1000,
         use_timestep_transform=True,
@@ -74,12 +85,13 @@ class FlashHeadPipeline:
             use_usp (`bool`, *optional*, defaults to False):
                 Enable distribution strategy of USP.
         """
-        self.param_dtype = param_dtype
+        self.param_dtype = param_dtype if param_dtype is not None else get_inference_dtype(device)
         self.device = device
         self.rank = dist.get_rank() if dist.is_initialized() else 0
         self.use_usp = use_usp and dist.is_initialized()
         self.model_type = model_type
         self.use_ltx = model_type == "lite"
+        logger.info(f"Inference precision: {self.param_dtype}")
 
         if self.use_ltx:
             model_dir = os.path.join(checkpoint_dir, "Model_Lite")
@@ -126,9 +138,11 @@ class FlashHeadPipeline:
         self.num_timesteps = num_timesteps
         self.use_timestep_transform = use_timestep_transform
 
-        if COMPILE_MODEL:
+        # Keep the FP16 compatibility path eager to avoid compilation overhead.
+        compile_models = self.param_dtype != torch.float16
+        if COMPILE_MODEL and compile_models:
             self.model = torch.compile(self.model)
-        if COMPILE_VAE:
+        if COMPILE_VAE and compile_models:
             if self.use_ltx:
                 self.vae.model.encode = torch.compile(self.vae.model.encode)
                 self.vae.model.decode = torch.compile(self.vae.model.decode)
